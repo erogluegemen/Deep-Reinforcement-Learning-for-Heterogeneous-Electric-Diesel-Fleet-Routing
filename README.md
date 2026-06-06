@@ -1,11 +1,6 @@
 # Deep Reinforcement Learning for Heterogeneous Electric-Diesel Fleet Routing
 
 Replication and extension of **POMO** (Policy Optimization with Multiple Optima, Kwon et al., NeurIPS 2020) to the Heterogeneous Electric-Diesel Vehicle Routing Problem with Time Windows (HEVRPTW).
-
-**Course:** ARI5002 Optimization for Artificial Intelligence  
-**Author:** Egemen Eroglu  
-**Deadline:** June 28, 2026
-
 ---
 
 ## Overview
