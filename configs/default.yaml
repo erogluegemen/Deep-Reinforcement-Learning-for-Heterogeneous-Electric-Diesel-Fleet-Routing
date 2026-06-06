@@ -1,0 +1,60 @@
+model:
+  d_model: 128
+  n_heads: 8
+  n_layers: 6
+  d_ff: 512
+  vehicle_embed_dim: 16
+  clip_c: 10.0
+
+training:
+  n_nodes: 50
+  batch_size: 64
+  lr: 1.0e-4
+  epochs: 100
+  capacity: 50
+  synthetic_instances_per_epoch: 2560
+
+inference:
+  use_augmentation: true
+  augmentation_count: 8
+
+vrptw:
+  time_horizon: 480  # minutes (8-hour work day for DHL)
+  service_time_min: 3
+  speed_kmh: 40.0   # average urban delivery speed
+
+ev:
+  range_km: 200.0
+
+depots:
+  SAW:
+    lat: 40.8986
+    lng: 29.3669
+  IGA:
+    lat: 41.2611
+    lng: 28.7425
+  CET:
+    lat: 41.0855
+    lng: 28.9742
+
+vehicle_capacities:
+  SCV:
+    weight_kg: 500
+    volume_m3: 4.2
+    is_electric: false
+    range_km: null
+  MCV:
+    weight_kg: 1000
+    volume_m3: 6.0
+    is_electric: false
+    range_km: null
+  LCV:
+    weight_kg: 1500
+    volume_m3: 13.5
+    is_electric: false
+    range_km: null
+  LCV_BEV:
+    weight_kg: 1500
+    volume_m3: 12.4
+    is_electric: true
+    range_km: 200.0

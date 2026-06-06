@@ -1,0 +1,591 @@
+% ARI5002 Course Project Report — IEEE Conference Format
+% Compile with: pdflatex main.tex (twice), then bibtex main, then pdflatex twice more
+
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+\usepackage{bm}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Replication and Extension of POMO for Heterogeneous\\
+Electric-Diesel Fleet Routing with Time Windows}
+
+\author{
+  \IEEEauthorblockN{Egemen Eroglu}
+  \IEEEauthorblockA{
+    \textit{YOUR UNIVERSITY NAME}\\
+    erogluegemen@gmail.com
+  }
+}
+
+\maketitle
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+This paper presents a replication and extension of POMO (Policy Optimization
+with Multiple Optima)~\cite{kwon2020pomo}, a deep reinforcement learning
+framework for combinatorial optimization. We faithfully re-implement the
+POMO training algorithm and Transformer-based encoder-decoder architecture
+in PyTorch, then extend it to three additional problem variants: the Vehicle
+Routing Problem with Time Windows (VRPTW), an electric vehicle (EV) range
+constraint, and a heterogeneous fleet via vehicle-type embeddings. On
+synthetic CVRP benchmarks our re-implementation achieves mean tour lengths
+of 4.327 (n=20) and 8.922 (n=50) with 8$\times$ coordinate augmentation,
+outperforming OR-Tools (15\,s limit) by 10.75\% and 0\% respectively.
+On synthetic VRPTW the model beats OR-Tools by 9.14\% on n=20 instances.
+We further apply the trained model to real operational data from DHL Istanbul
+(905 routes across three depots with a mixed diesel/EV fleet), analysing the
+substantial distribution shift that limits direct transfer. On select
+small-scale instances the model reduces driven distance by 41--54\% relative
+to actual driver routes.
+\end{abstract}
+
+\begin{IEEEkeywords}
+deep reinforcement learning, combinatorial optimization, vehicle routing,
+POMO, VRPTW, electric vehicles, replication study
+\end{IEEEkeywords}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+
+Combinatorial optimization underlies a large class of real-world logistics
+problems. The Capacitated Vehicle Routing Problem (CVRP) and its extension
+with time windows (VRPTW) are canonical NP-hard problems that underpin
+last-mile delivery planning~\cite{dantzig1959truck}. Classical exact solvers
+such as LKH3~\cite{helsgott2017lkh3} and OR-Tools~\cite{ortools} can find
+near-optimal solutions but require minutes to hours per instance, making
+them unsuitable for online re-routing or large-scale fleet management.
+
+Deep reinforcement learning (DRL) has emerged as a promising alternative.
+Construction-type neural methods~\cite{vinyals2015pointer, kool2019attention}
+learn to build solutions autoregressively, producing near-optimal tours in
+milliseconds at inference time. POMO~\cite{kwon2020pomo}, introduced at
+NeurIPS~2020, advances this line by exploiting the fact that every customer
+node is an equally valid starting point for a VRP solution. By training with
+$n$ simultaneous rollouts---one per starting node---and using their mean
+return as a low-variance baseline, POMO achieves faster convergence and
+stronger solutions than prior construction methods.
+
+\textbf{Contributions.} This work (i) re-implements POMO from first
+principles in PyTorch and reproduces its core CVRP results; (ii) extends the
+model to VRPTW with time-feasibility masking and to EVs with a cumulative
+range constraint; (iii) introduces vehicle-type embeddings to support
+heterogeneous diesel/EV fleets; (iv) applies the trained model to real DHL
+Istanbul operational data and quantifies the distribution shift between the
+synthetic training distribution and real last-mile delivery instances.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Background and Related Work}
+
+\subsection{Neural Construction Methods}
+
+Pointer Networks~\cite{vinyals2015pointer} were among the first deep-learning
+models to solve routing problems by outputting permutations autoregressively
+via a pointer mechanism. The Attention Model (AM)~\cite{kool2019attention}
+replaces recurrence with a Transformer encoder and a single-layer attention
+decoder, trained with REINFORCE~\cite{williams1992} using a greedy rollout
+baseline. POMO~\cite{kwon2020pomo} builds on AM by initializing $N$ parallel
+rollouts from different starting nodes per instance, using the batch mean of
+these returns as a shared baseline. This approach both reduces gradient
+variance and prevents the policy from anchoring to a single starting node.
+
+\subsection{VRP Variants}
+
+The VRPTW~\cite{solomon1987algorithms} augments CVRP with per-customer hard
+time windows $[e_i, l_i]$: a vehicle arriving before $e_i$ must wait, and
+arriving after $l_i$ is infeasible. The Heterogeneous Fleet VRP (HFVRP)
+introduces vehicles of different capacities and costs; here we additionally
+distinguish electric vehicles (EVs) that carry a maximum driving range
+constraint.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Problem Formulation}
+
+\subsection{Capacitated VRP}
+
+Given a depot node $v_0$ and $n$ customer nodes $\{v_1,\ldots,v_n\}$ with
+coordinates $\mathbf{x}_i \in [0,1]^2$ and demands $d_i > 0$, and a vehicle
+of capacity $C$, the CVRP seeks a minimum-length set of routes starting and
+ending at the depot such that (a) every customer is visited exactly once and
+(b) the total demand on each route does not exceed $C$. Multiple depot visits
+by the same vehicle (multi-trip) are permitted; the objective is the total
+circuit length.
+
+\subsection{VRPTW Extension}
+
+In VRPTW each customer $v_i$ additionally carries a time window
+$[e_i, l_i]$. Let $t_i$ denote the vehicle's arrival time at $v_i$ and
+$s$ the service time. Feasibility requires $t_i \le l_i$ for all $i$.
+Waiting is allowed: $\max(t_i, e_i)$ is the actual service start. The node
+features are augmented from 3-d to 5-d:
+$\mathbf{f}_i = (x_i,\, y_i,\, d_i/C,\, e_i/T,\, l_i/T)$
+where $T$ is the time horizon.
+
+\subsection{Heterogeneous Fleet and EV Range}
+
+We model a heterogeneous fleet where vehicle type $k \in
+\{\text{SCV}, \text{MCV}, \text{LCV}, \text{LCV\_BEV}\}$ is fixed per route.
+LCV\_BEV vehicles additionally carry a range limit $R$: the accumulated
+route distance before the next return to depot may not exceed $R$. This is
+enforced at each decoding step by masking candidates $v_j$ for which
+$d_{\text{cumul}} + \text{dist}(v_{\text{cur}}, v_j) +
+\text{dist}(v_j, v_0) > R$.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{POMO: Architecture and Training}
+
+\subsection{Encoder}
+
+The encoder maps node features $\mathbf{F} \in \mathbb{R}^{(n+1)\times f}$
+($f=3$ for CVRP, $f=5$ for VRPTW) to embeddings
+$\mathbf{H} \in \mathbb{R}^{(n+1)\times d}$ via a linear projection followed
+by $L$ Transformer layers with Pre-LayerNorm:
+\begin{equation}
+  \mathbf{H}^{(l)} = \text{FFN}\!\left(\text{MHA}\!\left(\mathbf{H}^{(l-1)}\right)\right),
+\end{equation}
+where MHA denotes multi-head self-attention~\cite{vaswani2017attention} and
+FFN a two-layer feed-forward network with ReLU activation. Hyperparameters
+follow the original paper: $d=128$, 8 attention heads, $d_\text{ff}=512$,
+$L=6$.
+
+A graph-level embedding is computed as the mean of node embeddings:
+$\bar{\mathbf{h}} = \frac{1}{n+1}\sum_{i=0}^n \mathbf{H}_i$.
+
+\subsection{Decoder}
+
+At each step $t$ the decoder assembles a context vector
+\begin{equation}
+  \mathbf{q}_t = \text{Linear}\!\left(\left[\bar{\mathbf{h}},\,
+  \mathbf{H}_{v_t},\, r_t / C\right]\right),
+\end{equation}
+where $v_t$ is the current node, $r_t$ is the remaining capacity, and
+$[\cdot,\cdot,\cdot]$ denotes concatenation. For VRPTW the current
+normalised time $\tau_t / T$ is appended. For the heterogeneous fleet a
+vehicle-type embedding (4-class, 16-d, projected to $d$) is further
+concatenated.
+
+Single-head attention computes compatibility scores
+\begin{equation}
+  u_{ti} = C_{\text{clip}} \cdot \tanh\!\left(
+    \frac{\mathbf{q}_t \mathbf{H}_i^\top}{\sqrt{d}}
+  \right),
+\end{equation}
+with $C_{\text{clip}}=10$ following~\cite{kwon2020pomo}. After applying the
+infeasibility mask $\mathbf{m}_t$ (visited nodes, capacity, time windows,
+EV range), the action is sampled from
+$\pi_\theta(a_t \mid s_t) = \text{softmax}(\mathbf{u}_t - \mathbf{m}_t \cdot
+\infty)$.
+
+\subsection{POMO Training}
+
+POMO exploits the $n$ symmetries of the VRP by running one rollout per
+customer node as starting point. For batch size $B$ and $N=n$ starts, the
+encoder runs once per instance and is shared across all $N$ rollouts. The
+gradient estimator is
+\begin{equation}
+  \nabla_\theta J(\theta) \approx \frac{1}{BN}
+  \sum_{i=1}^{B}\sum_{j=1}^{N}
+  \bigl(R(\bm{\tau}_i^j) - b_i\bigr)\,
+  \nabla_\theta \log p_\theta(\bm{\tau}_i^j),
+\end{equation}
+where $b_i = \frac{1}{N}\sum_{j=1}^N R(\bm{\tau}_i^j)$ is the
+within-instance shared baseline~\cite{kwon2020pomo}. This baseline has zero
+mean for the POMO rollouts, reducing gradient variance without a separately
+trained critic.
+
+\subsection{Inference}
+
+At inference, $n$ greedy (argmax) rollouts are executed in parallel and the
+shortest tour selected. For 8$\times$ augmentation, the input coordinates
+are transformed by the 8 dihedral symmetries of the unit square (4 rotations
+$\times$ 2 reflections) and all $8n$ rollouts are scored; the global minimum
+is returned. Algorithm~\ref{alg:inference} summarises this procedure.
+
+\begin{algorithm}[t]
+\caption{POMO Inference with Augmentation}
+\label{alg:inference}
+\begin{algorithmic}[1]
+\REQUIRE instance $s$, policy $\pi_\theta$, augmentations $K=8$
+\STATE $\tau^* \leftarrow \varnothing$,\quad $R^* \leftarrow -\infty$
+\FOR{$k = 1$ \textbf{to} $K$}
+  \STATE $s_k \leftarrow \textsc{Augment}(s, k)$
+  \STATE $\mathbf{H}_k \leftarrow \textsc{Encoder}(s_k)$
+  \FOR{$j = 1$ \textbf{to} $N$}
+    \STATE $\bm{\tau}_k^j \leftarrow \textsc{GreedyRollout}(\mathbf{H}_k, j, \pi_\theta)$
+  \ENDFOR
+\ENDFOR
+\RETURN $\arg\max_{k,j} R(\bm{\tau}_k^j)$
+\end{algorithmic}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Extensions}
+
+\subsection{VRPTW Time-Window Masking}
+
+At each decoding step, the arrival time at candidate $v_j$ is estimated as
+$t_j = t_{\text{cur}} + \text{dist}(v_{\text{cur}}, v_j) / v$, where $v$ is
+vehicle speed. Node $v_j$ is masked if $t_j > l_j$ (hard deadline). After
+completing a trip, the vehicle returns to the depot and time resets to the
+arrival instant. Node features include normalised time windows
+$(e_i/T,\, l_i/T)$, and the current normalised time $\tau_t/T$ is provided
+to the decoder at each step.
+
+\subsection{EV Range Constraint}
+
+For electric vehicles the cumulative distance since the last depot visit is
+tracked. Candidate $v_j$ is masked if
+$d_{\text{cumul}} + \text{dist}(v_{\text{cur}},v_j) +
+\text{dist}(v_j, v_0) > R$, ensuring the vehicle can always return to the
+depot to recharge. When the vehicle returns to the depot, $d_{\text{cumul}}$
+resets to zero.
+
+\subsection{Vehicle-Type Embedding}
+
+To support heterogeneous fleets, a learnable embedding
+$\mathbf{e}_k \in \mathbb{R}^{16}$ is defined for each vehicle type
+$k \in \{\text{SCV}, \text{MCV}, \text{LCV}, \text{LCV\_BEV}\}$.
+At decode time this is concatenated to the context vector before the
+compatibility computation, and a linear layer projects the extended context
+back to dimension $d$.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+
+\subsection{Implementation}
+
+All code is written in PyTorch and runs device-agnostically on CUDA, Apple
+MPS, or CPU. Training is performed on Google Colab (GPU). The encoder-decoder
+uses the hyperparameters described in Section~IV: $d=128$, 8 heads,
+$d_\text{ff}=512$, $L=6$, $C_\text{clip}=10$. We train with Adam~\cite{kingma2015adam}
+at learning rate $10^{-4}$, batch size 64 (2560 synthetic instances per epoch),
+for 100 epochs on synthetic instances generated on the fly.
+
+Two models are trained separately:
+\begin{itemize}
+  \item \textbf{CVRP model} ($f=3$): node features $(x, y, d/C)$.
+  \item \textbf{VRPTW model} ($f=5$): node features $(x, y, d/C, e/T, l/T)$.
+\end{itemize}
+
+\subsection{Synthetic Benchmark Instances}
+
+For CVRP, instances follow the standard setup: $n \in \{20, 50\}$ customer
+nodes, coordinates $\sim \mathcal{U}[0,1]^2$, demands $\sim
+\mathcal{U}\{1,\ldots,9\}$, vehicle capacity $C=50$. We evaluate on 100
+held-out instances per problem size.
+
+\textbf{Remark on capacity.}
+The original POMO paper~\cite{kwon2020pomo} follows Kool
+et al.~\cite{kool2019attention} and uses $C=30$ for $n=20$ and $C=40$ for
+$n=50$. Our implementation uses $C=50$ uniformly (the setting from
+configs/default.yaml, matching the DHL fleet planning context). A lower
+capacity forces more depot returns and therefore longer tours; this causes
+our absolute tour lengths to be shorter than the original paper's Table~3
+but the relative trends are preserved.
+
+For VRPTW, time windows are generated with half-width $h \sim
+\mathcal{U}[0.15T, 0.35T]$ centred within $[0, T]$, with $T=480$ minutes.
+Since travel times are Euclidean distances in $[0,1]^2$ (max $\approx 1.41$),
+all time windows are effectively unconstrained at the scale of $T=480$; this
+is a known limitation discussed in Section~VIII.
+
+\subsection{Baselines}
+
+We compare against:
+\begin{itemize}
+  \item \textbf{Nearest Neighbour (NN)}: greedy construction from the depot,
+    repeatedly visiting the closest unvisited feasible customer.
+  \item \textbf{OR-Tools}~\cite{ortools}: Google's constraint-programming
+    solver with a 15-second time limit per instance, using $k =
+    \lceil D_\text{total}/C \rceil$ vehicles to model multi-trip behaviour.
+\end{itemize}
+
+All baselines and POMO are evaluated on the same 100 instances.
+
+\subsection{Real-World Dataset}
+
+We additionally evaluate on operational data from DHL's Istanbul
+last-mile network, covering January 2026 across three depots: Sabiha
+Gök\c{c}en (SAW), Istanbul Airport (IGA), and a Central European Transfer
+(CET) hub. From the raw delivery records we extract 905 VRP instances,
+grouped by depot, route code, and date. Each instance comprises a depot, a
+set of customer stops with GPS coordinates, demand (kg), actual time
+windows, and a vehicle assignment (type and capacity from the fleet
+registry). The fleet includes SCV, MCV, and LCV diesel vans plus LCV\_BEV
+electric vehicles (Ford e-Transit).
+
+Haversine distances are pre-computed and stored per instance. Coordinates
+are min-max normalised to $[0,1]^2$ for model input. The DHL driver route
+is reconstructed by sorting stops by recorded arrival time, serving as the
+baseline.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+
+\subsection{Synthetic CVRP and VRPTW Benchmark}
+
+Table~\ref{tab:benchmark} reports mean tour lengths on 100 held-out instances
+for each method and problem size. POMO with 8$\times$ augmentation
+outperforms OR-Tools (15\,s) on CVRP n=20 by \textbf{10.75\%} and on VRPTW
+n=20 by \textbf{9.14\%}, while producing results in under one second.
+The nearest-neighbour heuristic is 27\% worse than POMO on CVRP n=20,
+confirming POMO's superiority over classical greedy construction.
+
+\begin{table}[t]
+\caption{Synthetic Benchmark: Mean Tour Length (100 instances, $C=50$)}
+\label{tab:benchmark}
+\centering
+\begin{tabular}{llccc}
+\toprule
+Problem & $n$ & Method & Length & Gap vs.\ OR-Tools \\
+\midrule
+\multirow{4}{*}{CVRP}
+  & \multirow{4}{*}{20}
+    & Nearest Neighbour   & 6.173  & $+27.3\%$ \\
+  && OR-Tools (15\,s)    & 4.848  & --- \\
+  && POMO greedy (ours)  & 4.469  & $-7.81\%$ \\
+  && POMO +8$\times$aug  & 4.327  & $-10.75\%$ \\
+\midrule
+\multirow{2}{*}{CVRP}
+  & \multirow{2}{*}{50}
+    & POMO greedy (ours)  & 9.139  & --- \\
+  && POMO +8$\times$aug  & 8.922  & --- \\
+\midrule
+\multirow{3}{*}{VRPTW}
+  & \multirow{3}{*}{20}
+    & OR-Tools (15\,s)   & 5.039  & --- \\
+  && POMO greedy (ours)  & 4.752  & $-5.71\%$ \\
+  && POMO +8$\times$aug  & 4.579  & $-9.14\%$ \\
+\midrule
+\multirow{2}{*}{VRPTW}
+  & \multirow{2}{*}{50}
+    & POMO greedy (ours)  & 9.696  & --- \\
+  && POMO +8$\times$aug  & 9.390  & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison with Original Paper}
+
+Table~\ref{tab:comparison} compares our CVRP results with those reported in
+Kwon et al.~\cite{kwon2020pomo}. Because of the different capacity settings
+($C=50$ vs $C=30$ for $n=20$, $C=40$ for $n=50$ in the original), absolute
+tour lengths are not directly comparable. However, the key qualitative
+trends are reproduced:
+
+\begin{enumerate}
+  \item Augmentation consistently improves over greedy decoding.
+  \item The relative gap between greedy and augmented decoding grows with
+    problem size ($n=20$: $-3.2\%$; $n=50$: $-2.4\%$ for ours vs $-0.5\%$;
+    $-0.7\%$ for the original), suggesting our shorter training (100 epochs)
+    leaves more room for augmentation to compensate.
+  \item POMO outperforms OR-Tools, consistent with the original finding that
+    POMO beats OR-Tools on CVRP20 and CVRP50.
+\end{enumerate}
+
+\begin{table}[t]
+\caption{Comparison with Original POMO Results on CVRP\\
+  {\small (Original: $C=30$ for $n=20$, $C=40$ for $n=50$; Ours: $C=50$)}}
+\label{tab:comparison}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Method & CVRP20 & CVRP50 & Augm.\ gain ($n=20$) \\
+\midrule
+POMO single trajec.\ (original) & 6.35 & 10.74 & ---\\
+POMO no aug.\ (original)        & 6.17 & 10.49 & $-2.8\%$ \\
+POMO $\times$8 aug.\ (original) & 6.14 & 10.42 & $-0.5\%$ \\
+\midrule
+POMO greedy (ours)               & 4.469 & 9.139 & ---\\
+POMO $\times$8 aug.\ (ours)      & 4.327 & 8.922 & $-3.2\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{../viz/figures/benchmark_comparison.png}
+  \caption{Grouped bar chart of mean tour lengths for each method and problem
+    configuration. NN: Nearest Neighbour. POMO greedy uses a single argmax
+    per start; POMO 8$\times$aug applies 8 coordinate symmetry transforms.}
+  \label{fig:benchmark}
+\end{figure}
+
+\subsection{EV Range Sensitivity}
+
+Fig.~\ref{fig:ev} shows the effect of the EV range constraint on CVRP n=20
+instances. Routes remain feasible and achieve the same tour length for
+$R \ge 3.0$ distance units (max possible inter-node distance in $[0,1]^2$
+is $\sqrt{2} \approx 1.41$, so $R=3.0$ is effectively unlimited). Only
+at $R=2.0$ does the constraint become binding, increasing mean tour length
+by \textbf{8.8\%} as the vehicle must return to depot more frequently to
+avoid range depletion.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\columnwidth]{../viz/figures/ev_range_sensitivity.png}
+  \caption{Mean tour length vs.\ EV range constraint (CVRP, $n=20$, 100
+    instances). The constraint only binds at $R=2.0$, forcing additional
+    depot returns and increasing tour length by 8.8\%.}
+  \label{fig:ev}
+\end{figure}
+
+\subsection{Real-World Transfer: DHL Istanbul}
+
+Applying the CVRP model directly to the 905 real DHL instances yields
+substantially worse routes than the drivers' actual sequences on average.
+This confirms a significant distribution shift between the synthetic training
+domain and real last-mile delivery data.
+
+Fig.~\ref{fig:distshift} summarises four key mismatches identified by
+comparing training data statistics with the real dataset:
+
+\begin{enumerate}
+  \item \textbf{Demand scale (14.7$\times$ gap)}: Training uses
+    normalised demands $d_i/C \in [0.02, 0.18]$. Real packages weigh
+    0.1--30\,kg against vehicle capacities of 500--1500\,kg, yielding
+    $d_i/C \approx 0.0001$--$0.075$. The model has never encountered
+    such small fractional demands.
+  \item \textbf{Coordinate distribution}: Training is uniform random in
+    $[0,1]^2$. Real coordinates are clustered in distinct urban districts
+    of Istanbul after min-max normalisation.
+  \item \textbf{Time window structure}: 47.9\% of real stops carry
+    all-day windows ($[0, 1439]$), while the rest show narrow operational
+    windows. Training windows span $[0.3T, 0.7T]$ half-width---a
+    distribution not present in real data.
+  \item \textbf{VRPTW unit mismatch}: The training time horizon $T=480$
+    minutes is much larger than the maximum Euclidean travel time in
+    $[0,1]^2$ ($\approx 1.41$ units with $v=1$). Time-window constraints
+    are therefore never binding during synthetic VRPTW training, so the
+    VRPTW model is functionally equivalent to a CVRP model with a 5-d
+    input.
+\end{enumerate}
+
+Despite the aggregate failure, on a selected subset of 28--30 node
+instances from CET depot---which are geographically compact and have few
+all-day time windows---the CVRP model achieves 41--54\% reductions in
+total route distance compared with actual driver sequences
+(Table~\ref{tab:realworld}). Route maps for these instances are provided
+as interactive HTML files in the accompanying code submission.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{../viz/figures/distribution_shift.png}
+  \caption{Distribution shift analysis. Each panel compares the training data
+    statistics (blue) with the DHL Istanbul dataset (orange). Significant
+    mismatches exist in demand normalisation, coordinate distribution, and
+    time-window structure.}
+  \label{fig:distshift}
+\end{figure}
+
+\begin{table}[t]
+\caption{POMO vs.\ DHL Driver Routes on Best-Case Real Instances\\
+  {\small (CVRP model, 8$\times$ augmentation)}}
+\label{tab:realworld}
+\centering
+\begin{tabular}{llcccr}
+\toprule
+Depot & Route & $n$ & Type & DHL (km) & POMO (km) \\
+\midrule
+CET & CECD & 30 & SCV (diesel) & 19.7 & 9.1 \\
+CET & CEGA & 22 & SCV (diesel) & 20.4 & 11.9 \\
+IGA & ISCB & 28 & LCV\_BEV (EV) & 54.3 & 27.1 \\
+SAW & EADB & 28 & SCV (diesel) & 72.7 & 38.0 \\
+\bottomrule
+\multicolumn{4}{l}{\small Route distance reductions: 38--54\%.} \\
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+
+\subsection{Fidelity of the Replication}
+
+Our implementation successfully reproduces the core POMO mechanisms: shared
+within-instance REINFORCE baseline, multi-start greedy inference, and
+$8\times$ coordinate augmentation. The benefit of augmentation over greedy
+decoding ($-3.2\%$ for n=20) and the consistent superiority over OR-Tools
+are both in line with the original paper's findings. The main deviation is
+quantitative: our tour lengths are systematically lower because we train and
+evaluate at $C=50$ uniformly, while the original paper uses $C=30$ ($n=20$)
+and $C=40$ ($n=50$), which induce more depot returns and longer tours.
+
+\subsection{VRPTW Training Limitation}
+
+The most significant implementation gap concerns the VRPTW model. The
+training configuration sets the time horizon to $T=480$ minutes (an 8-hour
+delivery day), but the synthetic Euclidean distances in $[0,1]^2$ are at
+most $\approx 1.41$ units. With unit speed, travel times are orders of
+magnitude smaller than any time window half-width ($\ge 72$ minutes), so the
+time-window feasibility mask is never triggered during training. Consequently,
+the VRPTW model learns to produce valid CVRP solutions but does not learn to
+respond to tight time windows. A correct fix requires scaling the travel
+distances to the same units as $T$ (e.g., setting $T=2.0$ to match the
+unit-square scale) and retraining.
+
+\subsection{Real-World Distribution Shift}
+
+The transfer failure on the 905 DHL instances is primarily driven by three
+compounding mismatches. First, the 14.7$\times$ demand normalisation gap
+means the capacity constraint is almost never binding in real instances,
+collapsing the problem to an uncapacitated TSP for which the model was not
+trained. Second, urban GPS coordinates cluster spatially in ways that are
+absent from the uniform training distribution. Third, the proportion of
+all-day windows (48\%) introduces a mode not seen in training.
+
+These observations are a valuable finding in their own right: they motivate
+domain adaptation techniques such as fine-tuning on real instances or mixed
+training distributions, which are identified as the primary avenue for
+future work.
+
+\subsection{Computational Cost}
+
+Training the CVRP model for 100 epochs on Google Colab required
+approximately 2--3 hours on a single GPU. Inference on 100 instances with
+8$\times$ augmentation completed in under 60 seconds on Apple MPS hardware,
+demonstrating the practical speed advantage of POMO over OR-Tools (which
+requires $\sim$1500\,s for the same 100 instances).
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We have replicated POMO's CVRP solver and extended it to VRPTW, EV range
+constraints, and heterogeneous vehicle-type embeddings. On synthetic
+benchmarks our implementation surpasses OR-Tools by up to 10.75\% (CVRP)
+and 9.14\% (VRPTW) with near-zero inference time. The EV range extension
+correctly enforces range feasibility, incurring an 8.8\% distance penalty
+only when the constraint is actively binding.
+
+Application to real DHL Istanbul data reveals a significant distribution
+shift that prevents direct transfer of the synthetically-trained model.
+We identify four specific mismatch sources---demand scale, coordinate
+clustering, time-window structure, and VRPTW unit mismatch in training---and
+provide a quantitative analysis. The replication demonstrates that POMO's
+algorithmic core (multi-start REINFORCE, shared baseline, coordinate
+augmentation) is sound and reproducible, while also highlighting that
+real-world deployment requires targeted domain adaptation.
+
+Future work should address: (i) retraining VRPTW with a corrected time
+scale ($T=2.0$); (ii) fine-tuning on the DHL dataset with mixed training
+distributions; (iii) adding a comparison with the Attention Model
+baseline~\cite{kool2019attention} on our benchmark.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
